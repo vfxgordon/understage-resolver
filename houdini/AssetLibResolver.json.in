@@ -1,0 +1,8 @@
+{
+    "enable": "houdini_version == '@Houdini_VERSION_MAJOR@.@Houdini_VERSION_MINOR@'",
+    "env": [
+        { "ASSETLIB_HOUDINI_PACKAGE": "@CMAKE_INSTALL_PREFIX@" },
+        { "PYTHONPATH": { "value": "$ASSETLIB_HOUDINI_PACKAGE/backends", "method": "prepend" } }@_pkg_env@
+    ],
+    "path": "$ASSETLIB_HOUDINI_PACKAGE"
+}
