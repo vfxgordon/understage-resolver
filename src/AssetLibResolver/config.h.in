@@ -28,7 +28,12 @@
 /// remote backend; a library without one is local-only.
 #define ASSETLIB_CONFIG_FILE "@ASSETLIB_CONFIG_FILE@"
 
-/// Provenance record written into each fetched version directory.
+/// Provenance record written into each fetched or published version
+/// directory.
 #define ASSETLIB_PROVENANCE_FILE "@ASSETLIB_PROVENANCE_FILE@"
+
+/// Marker file of a draft: a version directory that is still being written
+/// and has not been published. Unpinned resolution skips drafts.
+#define ASSETLIB_DRAFT_FILE "@ASSETLIB_DRAFT_FILE@"
 
 #endif

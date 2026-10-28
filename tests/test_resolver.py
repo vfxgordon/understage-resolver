@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -5,6 +6,7 @@ import sys
 import pytest
 from conftest import (
     composition_errors,
+    DRAFT_FILE,
     MANIFEST_ENV,
     ROBOT,
     ROOT_ENV,
@@ -14,6 +16,7 @@ from conftest import (
     publish,
     publish_robot,
     publish_servo,
+    servo_files,
 )
 from pxr import Ar, Pcp, Sdf, Usd
 
@@ -288,3 +291,63 @@ def test_create_new_into_explicit_version(library):
     with bound(ctx):
         Sdf.Layer.CreateNew(f"{L}components/servos/new?v=v005").Save()
     assert (library / "components/servos/new/v005/new.usda").is_file()
+
+
+# --- Drafts ---------------------------------------------------------------------
+
+
+def test_latest_skips_drafts(library):
+    """A draft is invisible to unpinned and ?v=latest references; an explicit
+    version or a pin still reaches it."""
+    publish(library, SERVO, 3, servo_files(3), draft=True)
+    ctx = ResolverContext.FromPins({}, str(library))
+    assert resolve(f"{L}{SERVO}", ctx).endswith("/v002/xm430.usda")
+    assert resolve(f"{L}{SERVO}?v=latest", ctx).endswith("/v002/xm430.usda")
+    assert resolve(f"{L}{SERVO}?v=v003", ctx).endswith("/v003/xm430.usda")
+    pinned = ResolverContext.FromPins({SERVO: "v003"}, str(library))
+    assert resolve(f"{L}{SERVO}", pinned).endswith("/v003/xm430.usda")
+
+
+def test_asset_with_only_drafts_has_no_latest(library):
+    publish(library, "props/wip", 1, {"wip.usda": "#usda 1.0\n"}, draft=True)
+    ctx = ResolverContext.FromPins({}, str(library))
+    assert resolve(f"{L}props/wip", ctx) == ""
+    assert resolve(f"{L}props/wip?v=v001", ctx).endswith("/v001/wip.usda")
+
+
+def test_new_asset_goes_into_a_new_draft_then_stays_there(library):
+    ctx = ResolverContext.FromPins({}, str(library))
+    with bound(ctx):
+        r = Ar.GetResolver()
+        first = r.ResolveForNewAsset(f"{L}{SERVO}").GetPathString()
+        # The draft exists, marked, before anything is written into it.
+        marker = library / SERVO / "v003" / DRAFT_FILE
+        assert first == str(library / SERVO / "v003" / "xm430.usda")
+        assert json.loads(marker.read_text())["version"] == "v003"
+        # Writing again targets the same open draft, not v004.
+        assert r.ResolveForNewAsset(f"{L}{SERVO}").GetPathString() == first
+        Sdf.Layer.CreateNew(f"{L}{SERVO}").Save()
+    assert (library / SERVO / "v003" / "xm430.usda").is_file()
+    # Still a draft, so readers keep getting v002.
+    assert resolve(f"{L}{SERVO}", ctx).endswith("/v002/xm430.usda")
+
+
+def test_new_draft_follows_a_published_newest_version(library):
+    publish(library, SERVO, 3, servo_files(3), draft=True)
+    publish(library, SERVO, 4, servo_files(4))  # published after the v003 draft
+    ctx = ResolverContext.FromPins({}, str(library))
+    with bound(ctx):
+        path = Ar.GetResolver().ResolveForNewAsset(f"{L}{SERVO}").GetPathString()
+    assert path.endswith("/v005/xm430.usda")
+    # An explicit version still reaches the older draft.
+    with bound(ctx):
+        path = Ar.GetResolver().ResolveForNewAsset(f"{L}{SERVO}?v=v003").GetPathString()
+    assert path.endswith("/v003/xm430.usda")
+
+
+def test_published_versions_are_not_written(library, capfd):
+    ctx = ResolverContext.FromPins({}, str(library))
+    with bound(ctx):
+        assert Ar.GetResolver().ResolveForNewAsset(f"{L}{SERVO}?v=v002").GetPathString() == ""
+    assert "it is published, not a draft" in capfd.readouterr().err
+    assert not (library / SERVO / "v002" / DRAFT_FILE).exists()

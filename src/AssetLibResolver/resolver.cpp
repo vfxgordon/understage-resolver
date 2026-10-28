@@ -8,6 +8,7 @@
 #include "resolverContext.h"
 #include "debugCodes.h"
 
+#include "pxr/base/js/json.h"
 #include "pxr/base/tf/fileUtils.h"
 #include "pxr/base/tf/getenv.h"
 #include "pxr/base/tf/pathUtils.h"
@@ -19,8 +20,15 @@
 #include "pxr/usd/ar/filesystemWritableAsset.h"
 #include "pxr/usd/ar/notice.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstdio>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
+
+#include <unistd.h>
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -162,10 +170,19 @@ _ParseLibUri(const std::string& uri, _LibUri* out, std::string* whyNot)
     return true;
 }
 
+// A draft is a version directory still being written: it holds the draft
+// marker until it is published.
+bool
+_IsDraft(const std::string& versionDir)
+{
+    return TfIsFile(TfStringCatPaths(versionDir, ASSETLIB_DRAFT_FILE));
+}
+
 // Scans assetDir for version directories in canonical form (v001, v014,
 // v1000). Returns the highest version number, or -1 if there are none.
+// Drafts count only with includeDrafts.
 long
-_FindLatestVersion(const std::string& assetDir)
+_FindLatestVersion(const std::string& assetDir, bool includeDrafts)
 {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -173,12 +190,44 @@ _FindLatestVersion(const std::string& assetDir)
     for (const auto& entry : fs::directory_iterator(assetDir, ec)) {
         const std::string name = entry.path().filename().string();
         const long num = _IsVersionToken(name) ? _ParseVersionNumber(name) : -1;
-        if (num > 0 && name == AssetLibFormatVersion(num) &&
-            entry.is_directory(ec)) {
-            best = std::max(best, num);
+        if (num > 0 && num > best && name == AssetLibFormatVersion(num) &&
+            entry.is_directory(ec) &&
+            (includeDrafts || !_IsDraft(entry.path().string()))) {
+            best = num;
         }
     }
     return best;
+}
+
+// Creates versionDir as a draft: the directory and its draft marker appear
+// together (built under a temporary name, then renamed), so no reader ever
+// sees an empty version that looks published. Returns true if versionDir is
+// a draft afterwards, including one another process just created.
+bool
+_CreateDraft(const std::string& asset, const std::string& versionDir)
+{
+    static std::atomic<unsigned> counter{0};
+    const std::string tmpDir = TfStringCatPaths(
+        TfGetPathName(versionDir),
+        TfStringPrintf(".draft-%s-%d-%u", TfGetBaseName(versionDir).c_str(),
+                       static_cast<int>(getpid()), counter++));
+    if (!TfMakeDirs(tmpDir, -1, /* existOk = */ false)) {
+        return false;
+    }
+    JsObject marker;
+    marker["asset"] = JsValue(asset);
+    marker["version"] = JsValue(TfGetBaseName(versionDir));
+    marker["created_at"] = JsValue(static_cast<int64_t>(time(nullptr)));
+    marker["created_by"] = JsValue(TfGetenv("USER"));
+    marker["created_with"] = JsValue(std::string("AssetLibResolver"));
+    {
+        std::ofstream out(TfStringCatPaths(tmpDir, ASSETLIB_DRAFT_FILE));
+        JsWriteToStream(JsValue(marker), out);
+    }
+    if (rename(tmpDir.c_str(), versionDir.c_str()) != 0) {
+        TfRmTree(tmpDir);
+    }
+    return _IsDraft(versionDir);
 }
 
 // Returns the entry layer <leaf>.<ext> in versionDir. Empty if there is
@@ -340,10 +389,12 @@ AssetLibResolver::_ResolveImpl(
     const std::shared_ptr<AssetLibFetcher> fetcher =
         AssetLibFetcher::ForRoot(root);
 
-    // Version precedence: explicit ?v= > context pin > latest. Latest
-    // considers the remote too, so an unfetched newer version wins. A new
-    // asset without an explicit version goes into the *next* version so
-    // that an existing published version is never overwritten implicitly.
+    // Version precedence: explicit ?v= > context pin > latest. Latest is
+    // the newest *published* version, local or remote, so an unfetched
+    // newer version wins and a draft is never picked up implicitly. A new
+    // asset without an explicit version goes into the open draft (the
+    // newest version, if it is a draft), else into a new draft after every
+    // existing version, so a published version is never overwritten.
     long versionNum = uri.version == _latest
         ? -1 : _ParseVersionNumber(uri.version);
     if (versionNum < 0 && uri.version.empty() && ctx) {
@@ -358,11 +409,15 @@ AssetLibResolver::_ResolveImpl(
         }
     }
     if (versionNum < 0) {
-        long latest = _FindLatestVersion(assetDir);
-        if (fetcher) {
-            latest = std::max(latest, fetcher->GetRemoteLatest(uri.asset));
+        const long remote = fetcher ? fetcher->GetRemoteLatest(uri.asset) : -1;
+        if (forNewAsset) {
+            const long newest = _FindLatestVersion(assetDir, true);
+            const bool openDraft = newest > remote && _IsDraft(
+                TfStringCatPaths(assetDir, AssetLibFormatVersion(newest)));
+            versionNum = openDraft ? newest : std::max({newest, remote, 0L}) + 1;
+        } else {
+            versionNum = std::max(_FindLatestVersion(assetDir, false), remote);
         }
-        versionNum = forNewAsset ? std::max(latest, 0L) + 1 : latest;
     }
     if (versionNum < 1) {
         TF_DEBUG(ASSETLIB_RESOLVER).Msg(
@@ -379,19 +434,32 @@ AssetLibResolver::_ResolveImpl(
         fetcher->EnsureVersion(uri.asset, versionNum);
     }
 
-    // A version fetched from the repository is a read-only copy of a
-    // published revision; never hand it out as a place to write.
-    if (forNewAsset && TfIsFile(TfStringCatPaths(
-            TfStringCatPaths(assetDir, version), ASSETLIB_PROVENANCE_FILE))) {
-        TF_WARN("AssetLibResolver: refusing to write into %s %s: it is a "
-                "read-only copy of a published revision. Publish a new "
-                "version instead (omit ?v= to target the next one).",
-                uri.asset.c_str(), version.c_str());
-        return std::string();
+    // Only drafts are written. A version fetched from the repository is a
+    // read-only copy of a published revision, and any other version without
+    // the draft marker is published too: never hand either out as a place
+    // to write. A version that doesn't exist yet is created as a draft.
+    const std::string versionDir = TfStringCatPaths(assetDir, version);
+    if (forNewAsset) {
+        if (TfIsFile(TfStringCatPaths(versionDir, ASSETLIB_PROVENANCE_FILE))) {
+            TF_WARN("AssetLibResolver: refusing to write into %s %s: it is a "
+                    "read-only copy of a published revision. Publish a new "
+                    "version instead (omit ?v= to target the next one).",
+                    uri.asset.c_str(), version.c_str());
+            return std::string();
+        }
+        if (TfIsDir(versionDir) ? !_IsDraft(versionDir)
+                                : !_CreateDraft(uri.asset, versionDir)) {
+            TF_WARN("AssetLibResolver: refusing to write into %s %s: %s",
+                    uri.asset.c_str(), version.c_str(), TfIsDir(versionDir)
+                        ? "it is published, not a draft. Write a new version "
+                          "instead (omit ?v= to target the next one)."
+                        : "cannot create the draft directory");
+            return std::string();
+        }
     }
 
     const std::string path = _FindEntryLayer(
-        TfStringCatPaths(assetDir, version), uri.Leaf(), forNewAsset);
+        versionDir, uri.Leaf(), forNewAsset);
     if (path.empty()) {
         TF_DEBUG(ASSETLIB_RESOLVER).Msg(
             "  '%s': no entry layer %s.{usd,usda,usdc} in %s/%s\n",

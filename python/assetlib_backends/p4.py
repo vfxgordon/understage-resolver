@@ -19,15 +19,32 @@ Uses the p4 command-line client with tagged JSON output (-ztag -Mj); no
 P4Python needed. Connection settings not given as options come from the
 usual P4PORT/P4USER/P4TICKETS/P4CONFIG environment.
 
+Publishing version N submits the asset's new files as one changelist,
+through a throwaway client workspace that maps only the asset's depot path
+(`sync -k`, so nothing is downloaded; `reconcile` finds adds, edits and
+deletes). It refuses unless the asset has exactly N-1 changes beforehand, and
+checks afterwards that the submitted change really is the Nth.
+
 Caveat: versions are positional, so obliterating history in an asset's
 depot path renumbers its versions. Published history must be append-only.
 """
 
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
+import uuid
+from pathlib import Path
 
-from assetlib_backends._protocol import BackendError, NotFound, main, safe_join
+from assetlib_backends._protocol import (
+    BackendError,
+    NotFound,
+    asset_files,
+    check_next_version,
+    main,
+    safe_join,
+)
 
 # Actions whose file revision is not present at that change.
 _DELETED = {"delete", "move/delete", "purge", "archive"}
@@ -46,14 +63,17 @@ class Perforce:
 
     # --- p4 plumbing --------------------------------------------------------
 
-    def _run(self, *args, tagged=True):
-        cmd = self.base + (["-ztag", "-Mj"] if tagged else []) + list(args)
+    def _run(self, *args, tagged=True, client=None, input=None):
+        cmd = (self.base + (["-c", client] if client else [])
+               + (["-ztag", "-Mj"] if tagged else []) + list(args))
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False,
+                                  input=input)
         except FileNotFoundError:
             raise BackendError(f"p4 client not found: {self.base[0]!r}") from None
         if proc.returncode != 0:
-            raise BackendError(f"{' '.join(args[:1])} failed: {proc.stderr.strip()}")
+            raise BackendError(f"{' '.join(args[:1])} failed: "
+                               f"{proc.stderr.strip() or proc.stdout.strip()}")
         if not tagged:
             return proc.stdout
         records = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
@@ -95,6 +115,44 @@ class Perforce:
             target = safe_join(dest, depot_file[len(prefix):])
             target.parent.mkdir(parents=True, exist_ok=True)
             self._run("print", "-q", "-o", str(target), f"{depot_file}@{change}", tagged=False)
+        return f"{prefix}...@{change}"
+
+    def publish(self, asset, version, src, message):
+        files = asset_files(src)
+        check_next_version(asset, version, len(self._changes(asset)))
+        prefix = self._asset_path(asset) + "/"
+        client = f"assetlib-publish-{uuid.uuid4().hex[:12]}"
+        root = Path(tempfile.mkdtemp(prefix="assetlib-p4-"))
+        spec = (f"Client: {client}\nRoot: {root}\n"
+                "Options: allwrite noclobber nocompress unlocked nomodtime rmdir\n"
+                f"LineEnd: share\nView:\n\t\"{prefix}...\" \"//{client}/...\"\n")
+        self._run("client", "-i", input=spec, tagged=False)
+        submitted = False
+        try:
+            # Record the current revisions as "have" without downloading them,
+            # then lay the new files down and let reconcile work out the diff.
+            self._run("sync", "-k", f"//{client}/...", client=client)
+            for rel in files:
+                target = root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src / rel, target)
+            self._run("reconcile", "-a", "-e", "-d", f"//{client}/...", client=client)
+            opened = self._run("opened", f"//{client}/...", client=client)
+            if not any("depotFile" in r for r in opened):
+                raise BackendError(f"{asset}: nothing changed since version {version - 1}")
+            records = self._run("submit", "-d", message, client=client)
+            submitted = True
+        finally:
+            if not submitted:
+                self._run("revert", "-k", f"//{client}/...", client=client)
+            self._run("client", "-d", client, tagged=False)
+            shutil.rmtree(root, ignore_errors=True)
+        change = next(int(r["submittedChange"]) for r in records if "submittedChange" in r)
+        changes = self._changes(asset)
+        actual = changes.index(change) + 1
+        if actual != version:
+            raise BackendError(f"{asset}: submitted change {change} became version {actual}, "
+                               f"not {version}: another publish got in first")
         return f"{prefix}...@{change}"
 
 

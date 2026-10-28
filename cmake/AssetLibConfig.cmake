@@ -29,7 +29,9 @@ set(ASSETLIB_OFFLINE_ENV_VAR "ASSET_LIBRARY_OFFLINE" CACHE STRING
 set(ASSETLIB_CONFIG_FILE ".assetlib.json" CACHE STRING
     "Per-library configuration file name, at the library root")
 set(ASSETLIB_PROVENANCE_FILE ".assetlib-source.json" CACHE STRING
-    "Provenance file written into each fetched version directory")
+    "Provenance file written into each fetched or published version directory")
+set(ASSETLIB_DRAFT_FILE ".assetlib-draft.json" CACHE STRING
+    "Marker file of an unpublished (draft) version directory")
 
 # RFC 3986 scheme syntax; Ar matches schemes case-insensitively, so require
 # lowercase to keep identifiers canonical.
@@ -44,7 +46,7 @@ foreach(_var ASSETLIB_ROOT_ENV_VAR ASSETLIB_MANIFEST_ENV_VAR
             "variable name")
     endif()
 endforeach()
-foreach(_var ASSETLIB_CONFIG_FILE ASSETLIB_PROVENANCE_FILE)
+foreach(_var ASSETLIB_CONFIG_FILE ASSETLIB_PROVENANCE_FILE ASSETLIB_DRAFT_FILE)
     if(NOT ${_var} MATCHES "^[A-Za-z0-9_.-]+$")
         message(FATAL_ERROR "${_var} '${${_var}}' must be a plain file name")
     endif()

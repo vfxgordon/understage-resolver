@@ -50,6 +50,12 @@ _GetProvenanceFileName()
     return ASSETLIB_PROVENANCE_FILE;
 }
 
+static std::string
+_GetDraftFileName()
+{
+    return ASSETLIB_DRAFT_FILE;
+}
+
 void
 wrapConfig()
 {
@@ -64,5 +70,8 @@ wrapConfig()
     def("GetConfigFileName", &_GetConfigFileName,
         "Per-library configuration file name (at the library root).");
     def("GetProvenanceFileName", &_GetProvenanceFileName,
-        "Provenance file written into each fetched version directory.");
+        "Provenance file written into each fetched or published version "
+        "directory.");
+    def("GetDraftFileName", &_GetDraftFileName,
+        "Marker file of a draft (unpublished) version directory.");
 }

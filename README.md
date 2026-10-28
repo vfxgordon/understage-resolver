@@ -40,12 +40,12 @@ public interface, never its internals.
 | `ustage:robots/franka` | the version pinned in the bound context, else latest |
 | `ustage:robots/franka?v=latest` | latest, ignoring pins |
 
-- **Latest** is the highest numbered `vNNN` folder, so `v010` beats `v009`.
+- **Latest** is the highest numbered *published* `vNNN` folder, so `v010` beats `v009`, and a draft is never picked up implicitly (see [Drafts](#drafts-and-publishing)).
 - **Library root** comes from the bound context, or else from `$ASSET_LIBRARY_ROOT`.
 - **Consistent versions:** resolved paths are plain filesystem paths. Sdf anchors relative paths against the referencing layer's *resolved* path, so `./geo.usda` inside `franka/v001/` always loads `v001/geo.usda`.
 - **File format:** `GetExtension` reports the entry layer's real extension, because Sdf picks the file format before resolving.
 - **Asset info:** `GetAssetInfo` reports the asset path and the version that was selected.
-- **Writing:** `Sdf.Layer.CreateNew("ustage:components/servos/new")` writes into the **next** version (`v001` for a new asset), so an existing published version is never overwritten implicitly. An explicit `?v=` writes into that version.
+- **Writing:** only drafts are written. `Sdf.Layer.CreateNew("ustage:components/servos/new")` writes into the asset's open draft, or else creates a new draft after every existing version (`v001` for a new asset). An explicit `?v=` writes into that version only if it is a draft or doesn't exist yet. A published version is never overwritten.
 - **Rejected URIs:** a malformed URI, a category instead of an asset, a version-shaped path segment, `..`, or two entry layers in one version all resolve to nothing.
 
 ## Published-asset rule
@@ -74,6 +74,25 @@ identifier is deliberately not empty: an empty reference path means an
 
 Scenes and work files that live outside the library may use unversioned
 references. They resolve through manifest pins and then latest.
+
+## Drafts and publishing
+
+A version starts life as a **draft**: a `vNNN/` folder holding a
+`.assetlib-draft.json` marker. Any version without the marker is published.
+
+| | Draft | Published |
+|---|---|---|
+| Marker | `.assetlib-draft.json` | none; `.assetlib-source.json` records where it was published or fetched from |
+| `ustage:asset`, `?v=latest` | skipped | the newest one is selected |
+| `?v=vNNN`, manifest pins | resolve | resolve |
+| Writes (`Sdf.Layer.CreateNew`) | allowed | refused |
+| Files | writable | write-protected, once published by a tool that does it (`ustage publish`, fetches) |
+
+- **The open draft.** If an asset's newest version is a draft, unversioned writes go into it, so repeated saves while working on an asset land in one draft rather than a new version each time. Otherwise the first write creates the next version as a draft.
+- **Resolving for a new asset creates the draft.** `ResolveForNewAsset` makes the version folder and its marker together (built under a temporary name, then renamed), so the answer is stable across calls and no reader ever sees an empty folder that looks published. An empty draft is harmless: nothing resolves it implicitly.
+- **The published-asset rule applies to drafts too.** A draft must already reference other assets by explicit version, and it must not reference another draft, because that can still change.
+- **Publishing** is done by the pipeline (`ustage publish` in [understage-pipe](../understage-pipe)): it checks the draft, submits it through the library's backend if there is one (the backend's `publish` command, below), records `.assetlib-source.json`, removes the marker and write-protects the folder.
+- **Existing libraries keep working.** Folders written before drafts existed have no marker, so they are published.
 
 ## Release manifests
 
@@ -152,7 +171,10 @@ returning**.
 - **Unversioned paths:** `latest` and new-version numbering both take the remote's versions into account.
 
 Backends are external commands speaking a small JSON protocol
-([docs/backend-protocol.md](docs/backend-protocol.md)), configured per library:
+([docs/backend-protocol.md](docs/backend-protocol.md)), configured per library.
+Besides listing and fetching versions, a backend can **publish** one: submit a
+draft as the asset's next revision, refusing if the remote's next version
+number isn't the draft's.
 
 ```json
 { "backend": { "command": ["python3", "-m", "assetlib_backends.p4",
@@ -161,11 +183,11 @@ Backends are external commands speaking a small JSON protocol
 
 Included backends:
 
-| Backend | Version N is | Exported with |
-|---|---|---|
-| `assetlib_backends.p4` (Perforce, `p4` CLI, no P4Python) | the Nth submitted changelist touching `<depot-root>/<asset>/...` | `p4 print` at that changelist |
-| `assetlib_backends.lore` ([Lore](https://github.com/EpicGames/lore), `lore` CLI) | the Nth revision changing `<asset>/` (`lore file history`) | `lore repository dump` + `lore file write --address`, in a private **bare** instance (`lore clone --bare`: metadata only, no working tree) |
-| `assetlib_backends.dirremote` | `<remote>/<asset>/<N>/` | a copy. Used by the tests, and the smallest example to copy for a new backend |
+| Backend | Version N is | Exported with | Published with |
+|---|---|---|---|
+| `assetlib_backends.p4` (Perforce, `p4` CLI, no P4Python) | the Nth submitted changelist touching `<depot-root>/<asset>/...` | `p4 print` at that changelist | one changelist, from a throwaway client that maps only the asset (`sync -k`, `reconcile`, `submit`) |
+| `assetlib_backends.lore` ([Lore](https://github.com/EpicGames/lore), `lore` CLI) | the Nth revision changing `<asset>/` (`lore file history`) | `lore repository dump` + `lore file write --address`, in a private **bare** instance (`lore clone --bare`: metadata only, no working tree) | `stage --scan`, `commit`, `push` from a temporary working-tree clone (a full checkout) |
+| `assetlib_backends.dirremote` | `<remote>/<asset>/<N>/` | a copy. Used by the tests, and the smallest example to copy for a new backend | a copy, renamed into place |
 
 ```json
 { "backend": { "command": ["python3", "-m", "assetlib_backends.lore",
@@ -226,7 +248,7 @@ helper. See [houdini/README.md](houdini/README.md).
 | URI scheme | CMake `-DASSETLIB_URI_SCHEME=<scheme>` | `ustage` |
 | Offline mode | environment variable | `$ASSET_LIBRARY_OFFLINE` |
 | Root / manifest / offline variable names | CMake `-DASSETLIB_ROOT_ENV_VAR=...`, `-DASSETLIB_MANIFEST_ENV_VAR=...`, `-DASSETLIB_OFFLINE_ENV_VAR=...` | as above |
-| Library config / provenance file names | CMake `-DASSETLIB_CONFIG_FILE=...`, `-DASSETLIB_PROVENANCE_FILE=...` | `.assetlib.json`, `.assetlib-source.json` |
+| Library config / provenance / draft marker file names | CMake `-DASSETLIB_CONFIG_FILE=...`, `-DASSETLIB_PROVENANCE_FILE=...`, `-DASSETLIB_DRAFT_FILE=...` | `.assetlib.json`, `.assetlib-source.json`, `.assetlib-draft.json` |
 
 The build-time settings are written into a generated `config.h` (from
 `src/AssetLibResolver/config.h.in`) and into `plugInfo.json`, so the C++ code and
@@ -290,11 +312,11 @@ install/lib/python/assetlib_backends/                  backend helpers
 - `cmake/AssetLibConfig.cmake`: the build settings, generated `config.h` and source lists, shared by every build.
 - `houdini/`: the Houdini package build, the FS helper (`src/FS_AssetLibHelper.C`) and the Houdini test runner.
 - `python/assetlib_backends/`: the backend helpers (Perforce, Lore, directory) and the shared protocol code.
-- `tests/test_resolver.py`: covers resolution, pins, anchoring, dependency locking, the published-asset rule, live refresh and writing.
-- `tests/test_fetch.py`: covers fetch on miss, latest, offline mode, concurrency, failures, timeouts, write protection and prefetch.
+- `tests/test_resolver.py`: covers resolution, pins, anchoring, dependency locking, the published-asset rule, live refresh, writing and drafts.
+- `tests/test_fetch.py`: covers fetch on miss, latest, offline mode, concurrency, failures, timeouts, write protection, prefetch, drafts against a remote and publishing through the directory backend.
 - `tests/test_localize.py`: localized output opened by a USD with no resolver plugin.
-- `tests/test_p4.py`: the Perforce backend against a real `p4d`.
-- `tests/test_lore.py`: the Lore backend against a real `loreserver`.
+- `tests/test_p4.py`: the Perforce backend, fetching and publishing, against a real `p4d`.
+- `tests/test_lore.py`: the Lore backend, fetching and publishing, against a real `loreserver`.
 
 ## License
 

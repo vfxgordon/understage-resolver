@@ -6,6 +6,9 @@
 
 Layout of the "remote":  <remote>/<asset>/<N>/...   (N = 1, 2, ...)
 
+Publishing copies the new version in under a temporary name and renames it
+into place, so a half-written version is never visible.
+
 Used by the test suite, and as a minimal example of a backend. Test hooks,
 all optional, via environment variables:
 
@@ -21,7 +24,13 @@ import sys
 import time
 from pathlib import Path
 
-from assetlib_backends._protocol import BackendError, NotFound, main
+from assetlib_backends._protocol import (
+    BackendError,
+    NotFound,
+    asset_files,
+    check_next_version,
+    main,
+)
 
 
 class DirRemote:
@@ -48,6 +57,22 @@ class DirRemote:
             raise BackendError(f"simulated failure fetching {asset} {version}")
         shutil.copytree(src, dest, dirs_exist_ok=True)
         return f"{src}"
+
+    def publish(self, asset, version, src, message):
+        _hooks("publish", asset, version)
+        asset_files(src)  # refuses symlinks
+        check_next_version(asset, version, max(self.list_versions(asset), default=0))
+        target = self.remote / asset / str(version)
+        tmp = target.with_name(f".publish-{version}-{os.getpid()}")
+        shutil.copytree(src, tmp)
+        try:
+            os.rename(tmp, target)
+        except OSError:
+            shutil.rmtree(tmp)
+            raise BackendError(f"{asset} version {version} appeared while publishing") from None
+        # Beside the version, not in it: fetch copies the version folder whole.
+        target.with_name(f"{version}.message").write_text(message + "\n")
+        return f"{target}"
 
 
 def _hooks(*words):

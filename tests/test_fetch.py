@@ -3,11 +3,25 @@
 import json
 import os
 import stat
+import subprocess
 import time
 from pathlib import Path
 
 import pytest
-from conftest import L, OFFLINE_ENV, PROVENANCE_FILE, ROBOT, SERVO, composition_errors
+from conftest import (
+    CONFIG_FILE,
+    DRAFT_FILE,
+    OFFLINE_ENV,
+    PROVENANCE_FILE,
+    ROBOT,
+    SERVO,
+    L,
+    backend_publish,
+    check_backend_publish,
+    composition_errors,
+    publish,
+    servo_files,
+)
 from pxr import Ar, Sdf, Usd
 
 import AssetLibResolver
@@ -261,3 +275,46 @@ def test_layer_written_via_sdf_still_works_in_local_only_library(tmp_path):
         Sdf.Layer.CreateNew(f"{L}props/thing").Save()
     assert (root / "props/thing/v001/thing.usda").is_file()
     assert not (root / "props/thing/v001" / PROVENANCE_FILE).exists()
+
+
+# --- Drafts and publishing ------------------------------------------------------
+
+
+def test_local_draft_is_skipped_and_reused(remote_library):
+    lib = remote_library()
+    publish(lib.root, SERVO, 3, servo_files(3), draft=True)
+    assert resolve(lib, f"{L}{SERVO}").endswith("/v002/xm430.usda")
+    with Ar.ResolverContextBinder(Ar.ResolverContext(lib.context())):
+        path = Ar.GetResolver().ResolveForNewAsset(f"{L}{SERVO}").GetPathString()
+    assert path == str(lib.root / SERVO / "v003" / "xm430.usda")
+
+
+def test_draft_overtaken_by_the_remote_is_not_reused(remote_library):
+    """Someone else published v003 first: new writes go to a new draft."""
+    lib = remote_library()
+    publish(lib.root, SERVO, 3, servo_files(3), draft=True)
+    publish(lib.remote, SERVO, 3, servo_files(3), dirname="3")
+    with Ar.ResolverContextBinder(Ar.ResolverContext(lib.context())):
+        path = Ar.GetResolver().ResolveForNewAsset(f"{L}{SERVO}").GetPathString()
+    assert path == str(lib.root / SERVO / "v004" / "xm430.usda")
+    assert (lib.root / SERVO / "v004" / DRAFT_FILE).is_file()
+
+
+def test_dirremote_publish(remote_library, tmp_path):
+    lib = remote_library()
+    check_backend_publish(lib.root, tmp_path / "src")
+    assert (lib.remote / SERVO / "3.message").read_text() == "servo v3\n"
+
+
+def test_publish_refuses_symlinks(remote_library, tmp_path):
+    lib = remote_library()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "outside.usda").write_text("#usda 1.0\n")
+    r = backend_publish(lib.root, SERVO, 3, servo_files(3), tmp_path / "src")
+    assert r.returncode == 0
+    src = next((tmp_path / "src").iterdir())
+    (src / "link.usda").symlink_to(tmp_path / "outside.usda")
+    command = json.loads((lib.root / CONFIG_FILE).read_text())["backend"]["command"]
+    r = subprocess.run([*command, "publish", SERVO, "4", str(src)], capture_output=True,
+                       text=True, check=False)
+    assert r.returncode == 1 and "symlink" in r.stderr

@@ -41,10 +41,18 @@ PXR_NAMESPACE_OPEN_SCOPE
 /// Version selection, highest priority first:
 ///   1. an explicit \c ?v=vNNN in the URI (\c ?v=latest skips pins),
 ///   2. a pin in the bound AssetLibResolverContext (keyed by asset path),
-///   3. the highest \c vNNN directory on disk.
+///   3. the highest published \c vNNN, on disk or on the remote.
 ///
-/// Writing (Sdf.Layer.CreateNew) without an explicit version creates the
-/// next version, never overwriting an existing one implicitly.
+/// A **draft** is a version directory holding the draft marker
+/// (\c .assetlib-draft.json, set by \c ASSETLIB_DRAFT_FILE): one that is
+/// still being written. Latest skips drafts; only an explicit version or a
+/// pin reaches one. Every other version is published.
+///
+/// Writing (Sdf.Layer.CreateNew) only ever goes into a draft. Without an
+/// explicit version it targets the open draft (the newest version, if it
+/// is a draft), else creates a new draft after every existing version. An
+/// explicit version is written only if it is a draft or doesn't exist yet.
+/// Resolving for a new asset creates the draft directory and its marker.
 ///
 /// **Published-asset rule.** Inside a published asset version, the asset's
 /// own files are referenced by relative paths (never versioned), and any

@@ -26,6 +26,13 @@ Tested against Lore v0.10.0. Lore is pre-1.0 and its CLI has no structured
 (JSON) output, so the text of `repository dump` and `file history` is parsed
 strictly: an unrecognized line is an error, never silently skipped.
 
+Publishing version N clones a working tree into a temporary directory,
+replaces the asset's directory with the new files, stages them with
+`lore stage --scan` (adds, edits and deletes), commits and pushes. It refuses
+unless the asset has exactly N-1 revisions beforehand, and checks afterwards
+that the pushed revision really is the Nth. The clone is a full working tree,
+so publishing into a large repository costs a full checkout.
+
 Caveat: versions are positional in the asset's history, so rewriting that
 history renumbers its versions. Published history must be append-only.
 """
@@ -36,9 +43,17 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-from assetlib_backends._protocol import BackendError, NotFound, main, safe_join
+from assetlib_backends._protocol import (
+    BackendError,
+    NotFound,
+    asset_files,
+    check_next_version,
+    main,
+    safe_join,
+)
 
 # Exit code `lore` uses for "file not found" (path absent at that revision).
 _LORE_NOT_FOUND = 82
@@ -183,6 +198,44 @@ class Lore:
             target.parent.mkdir(parents=True, exist_ok=True)
             self._run("file", "write", "--address", addr, "--output", str(target))
         return f"{self.url}/{self._asset_path(asset)}@{number} ({signature})"
+
+    def publish(self, asset, version, src, message):
+        files = asset_files(src)
+        check_next_version(asset, version, len(self._revisions(asset)))
+        path = self._asset_path(asset)
+        with tempfile.TemporaryDirectory(prefix="assetlib-lore-") as tmp:
+            ws = Path(tmp) / "ws"
+            clone = ["clone", self.url, str(ws)] + (["--branch", self.branch] if self.branch else [])
+            self._lore(Path(tmp), *clone)
+            target = ws / path
+            shutil.rmtree(target, ignore_errors=True)
+            for rel in files:
+                out = safe_join(target, rel) if target.exists() else target / rel
+                out.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src / rel, out)
+            self._lore(ws, "stage", "--scan", path)
+            self._lore(ws, "commit", message, nothing_staged=(
+                f"{asset}: nothing changed since version {version - 1}"))
+            self._lore(ws, "push")
+        revisions = self._revisions(asset)
+        if len(revisions) != version:
+            raise BackendError(f"{asset}: the push made {len(revisions)} versions, not "
+                               f"{version}: another publish got in first")
+        number, signature = revisions[-1]
+        return f"{self.url}/{path}@{number} ({signature})"
+
+    def _lore(self, cwd, *args, nothing_staged=None):
+        """Run lore in a working tree (not the bare instance); return stdout.
+        With nothing_staged, lore's "Nothing staged for commit" raises that
+        message instead."""
+        proc = subprocess.run([self.lore, "--non-interactive", "--no-pager", *args], cwd=cwd,
+                              capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            output = proc.stderr.strip() or proc.stdout.strip()
+            if nothing_staged and "Nothing staged for commit" in proc.stderr + proc.stdout:
+                raise BackendError(nothing_staged)
+            raise BackendError(f"lore {args[0]} failed (exit {proc.returncode}): {output}")
+        return proc.stdout
 
 
 def _default_instance(url):

@@ -70,12 +70,36 @@ else:
 So a helper never needs to clean up after itself and never sees, or
 creates, `vNNN` names.
 
+### `publish <asset> <N> <src> [-m <message>]` (optional)
+
+Submit the files in the directory `<src>`, laid out relative to the asset
+root, as the asset's new content, so that they become remote version `N`.
+Files the asset had before and `<src>` lacks are deleted: a version is the
+whole asset. Then print:
+
+```json
+{"source": "//depot/assets/robots/franka/...@12346", "protocol": 1}
+```
+
+- `source` is the same provenance `fetch` would report for version `N`.
+- **Before submitting anything,** fail with exit code 3 if the remote doesn't have exactly `N - 1` versions. Then nobody else's revision is overwritten or renumbered.
+- **After submitting,** check that the new revision really is version `N`, and fail loudly if another publish got in between.
+- Fail if nothing changed since version `N - 1`: the repository would record no new revision.
+- `<src>` holds only the asset's own files: the caller leaves out its draft marker and provenance. Symlinks are refused.
+- The message defaults to `Publish <asset> vNNN`.
+
+The resolver never calls `publish`. It is for the publishing tool
+(`ustage publish`), which then records provenance and write-protects the local
+copy so it matches what a fetch of version `N` would produce. A backend
+without `publish` fails it with a message.
+
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | 0 | success; stdout holds the JSON object |
 | 2 | the asset or version does not exist on the remote |
+| 3 | `publish` only: the remote's next version isn't `N` |
 | other | any other failure |
 
 ## Guarantees the resolver relies on
@@ -89,7 +113,9 @@ creates, `vNNN` names.
 ## Writing a backend in Python
 
 `assetlib_backends._protocol.main` handles argument parsing, the JSON
-output, exit codes and path-safety checks. A backend implements two methods:
+output, exit codes and path-safety checks. A backend implements two methods,
+and optionally a third. For `publish`, `check_next_version` and `asset_files`
+in the same module do the version check and refuse symlinks:
 
 ```python
 from assetlib_backends._protocol import NotFound, main
@@ -97,6 +123,7 @@ from assetlib_backends._protocol import NotFound, main
 class MyBackend:
     def list_versions(self, asset) -> list[int]: ...
     def fetch(self, asset, version, dest) -> str: ...   # returns provenance
+    def publish(self, asset, version, src, message) -> str: ...   # optional
 
 if __name__ == "__main__":
     raise SystemExit(main(lambda args: MyBackend()))

@@ -11,6 +11,7 @@ individually (e.g. for the Houdini package, see houdini/run_tests.sh):
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -45,6 +46,7 @@ MANIFEST_ENV = AssetLibResolver.GetManifestEnvVar() if AssetLibResolver else ""
 OFFLINE_ENV = AssetLibResolver.GetOfflineEnvVar() if AssetLibResolver else ""
 CONFIG_FILE = AssetLibResolver.GetConfigFileName() if AssetLibResolver else ""
 PROVENANCE_FILE = AssetLibResolver.GetProvenanceFileName() if AssetLibResolver else ""
+DRAFT_FILE = AssetLibResolver.GetDraftFileName() if AssetLibResolver else ""
 
 SERVO = "components/servos/xm430"
 ROBOT = "robots/franka"
@@ -93,12 +95,15 @@ over "franka"
 
 
 def publish(root: Path, asset: str, num: int, files: dict[str, str],
-            dirname: str | None = None) -> Path:
-    """Write files into <root>/<asset>/vNNN/ (or <dirname>) and return it."""
+            dirname: str | None = None, draft: bool = False) -> Path:
+    """Write files into <root>/<asset>/vNNN/ (or <dirname>) and return it.
+    With draft, the version also gets the draft marker."""
     vdir = root / asset / (dirname or f"v{num:03d}")
     vdir.mkdir(parents=True)
     for name, text in files.items():
         (vdir / name).write_text(text)
+    if draft:
+        (vdir / DRAFT_FILE).write_text("{}")
     return vdir
 
 
@@ -192,6 +197,59 @@ def write_manifest(tmp_path):
         return path
 
     return _write
+
+
+def backend_publish(root: Path, asset: str, version: int, files: dict[str, str], tmp: Path,
+                    message: str = "") -> subprocess.CompletedProcess:
+    """Run the `publish` command of root's backend on a folder holding files."""
+    src = tmp / f"publish-{asset.replace('/', '_')}-{version}-{len(list(tmp.iterdir()))}"
+    for name, text in files.items():
+        (src / name).parent.mkdir(parents=True, exist_ok=True)
+        (src / name).write_text(text)
+    command = json.loads((root / CONFIG_FILE).read_text())["backend"]["command"]
+    args = [*command, "publish", asset, str(version), str(src)]
+    return subprocess.run(args + (["-m", message] if message else []),
+                          capture_output=True, text=True, check=False)
+
+
+def check_backend_publish(root: Path, tmp: Path) -> None:
+    """Publish through root's backend, then read the versions back through the
+    resolver: new files, edits and deletions all arrive; a wrong version
+    number is refused before anything is submitted. The remote must hold
+    servo versions 1 and 2."""
+    from pxr import Ar, Usd
+
+    def resolve(uri):
+        ctx = Ar.ResolverContext(AssetLibResolver.ResolverContext.FromPins({}, str(root)))
+        with Ar.ResolverContextBinder(ctx):
+            return Ar.GetResolver().Resolve(uri).GetPathString()
+
+    tmp.mkdir()
+    v3 = {**servo_files(3), "docs/notes.usda": "#usda 1.0\n"}
+    r = backend_publish(root, SERVO, 3, v3, tmp, message="servo v3")
+    assert r.returncode == 0, r.stderr
+    source = json.loads(r.stdout)["source"]
+    entry = resolve(f"{L}{SERVO}")
+    assert entry == str(root / SERVO / "v003" / "xm430.usda")
+    assert Usd.Stage.Open(entry).GetPrimAtPath("/xm430").GetAttribute(
+        "pipeline:version").Get() == 3
+    assert (root / SERVO / "v003" / "docs" / "notes.usda").is_file()
+    assert json.loads((root / SERVO / "v003" / PROVENANCE_FILE).read_text())["source"] == source
+
+    # v4 drops the notes file: a version is the whole asset, deletions included.
+    r = backend_publish(root, SERVO, 4, servo_files(4), tmp)
+    assert r.returncode == 0, r.stderr
+    vdir = Path(resolve(f"{L}{SERVO}?v=4")).parent
+    assert not (vdir / "docs").exists()
+
+    # The remote has 4 versions, so 4 (taken) and 6 (a gap) are conflicts.
+    for wrong in (4, 6):
+        r = backend_publish(root, SERVO, wrong, servo_files(wrong), tmp)
+        assert r.returncode == 3, r.stderr
+        assert "next one is 5" in r.stderr
+    r = subprocess.run([*json.loads((root / CONFIG_FILE).read_text())["backend"]["command"],
+                        "list-versions", SERVO], capture_output=True, text=True, check=True)
+    assert json.loads(r.stdout)["versions"] == [1, 2, 3, 4]
 
 
 def composition_errors(stage):

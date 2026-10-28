@@ -17,6 +17,7 @@ from conftest import (
     ROBOT,
     SERVO,
     L,
+    check_backend_publish,
     composition_errors,
     robot_files,
     servo_files,
@@ -158,3 +159,21 @@ def test_fetched_files_are_read_only(depot, cache):
     entry = Path(resolve(cache, f"{L}{SERVO}?v=2"))
     with pytest.raises(PermissionError):
         entry.write_text("oops")
+
+
+def test_publish(depot, cache, tmp_path):
+    check_backend_publish(cache, tmp_path / "src")
+    # One changelist per version, with the given description, and no
+    # publishing workspace left behind.
+    changes = depot.p4("changes", "-l", f"{DEPOT_ROOT}/{SERVO}/...")
+    assert "servo v3" in changes
+    assert "assetlib-publish" not in depot.p4("clients")
+
+
+def test_publish_without_changes_is_refused(depot, cache, tmp_path):
+    from conftest import backend_publish
+
+    (tmp_path / "src").mkdir()
+    r = backend_publish(cache, SERVO, 3, servo_files(2), tmp_path / "src")
+    assert r.returncode == 1 and "nothing changed since version 2" in r.stderr
+    assert "assetlib-publish" not in depot.p4("clients")
